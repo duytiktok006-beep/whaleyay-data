@@ -35,6 +35,21 @@ KEEP_MAX = 1500
 STALE_MS = 24 * 3600e3   # holders not re-scanned for 24 h are dropped from the output
 DEX_KEEP_MS = 14 * 864e5 # remember a sub-dex for an address for 14 days after the last position / balance on it
 FULLDEX_EVERY_MS = 7 * 864e5   # every address gets a full sub-dex sweep at least every 7 days (rotating)
+# trader cohorts (documented in README + the site's (i) notes)
+PNL_EDGES = [1e6, 1e5, 1e4, -1e4, -1e5]   # all-time PnL (leaderboard): >= $1M | $100K-1M | $10K-100K | -$10K..$10K | -$100K..-$10K | <= -$100K
+SIZE_EDGES = [1e4, 1e5, 1e6, 1e7]         # account value: < $10K | $10K-100K | $100K-1M | $1M-10M | >= $10M
+def pnl_coh(pl):
+    if pl is None: return -1
+    for i, e in enumerate(PNL_EDGES[:3]):
+        if pl >= e: return i
+    return 3 if pl > PNL_EDGES[3] else 4 if pl > PNL_EDGES[4] else 5
+def size_coh(av):
+    for i, e in enumerate(SIZE_EDGES):
+        if av < e: return i
+    return len(SIZE_EDGES)
+CH_MIN = 1000              # position changes: ignore changes worth < $1k
+CH_KEEP_MS = 24 * 3600e3   # keep 24 h of changes in the state
+CH_SPAN_MAX = 26 * 3600e3  # a change found more than 26 h after the previous scan of that wallet is not reported (too vague)
 stats = {"calls": 0, "weight": 0, "r429": 0, "errors": 0}
 
 # ---------------- rate-limited HTTP ----------------
@@ -88,26 +103,41 @@ except Exception: state = {}
 state.setdefault("v", 1)
 A = state.setdefault("a", {})     # addr -> {av, ts (last main scan), dx:{dex:lastSeen}, fd (last full sub-dex sweep), p:{coin:[...]}, pts:{dex:ts}, fs:{coin|side:firstSeen}, src}
 state.setdefault("known_dexes", [])
+EV = [e for e in state.get("ev", []) if NOW - e[2] * 1000 < CH_KEEP_MS]   # changes: [addr, coin, t(s), tPrev(s), sziBefore, sziAfter, px]
+state["ev"] = EV
+RUNS = [t for t in state.get("runs", []) if NOW - t * 1000 < 7 * 864e5] + [NOW // 1000]; state["runs"] = RUNS[-100:]
 def rec(a): return A.setdefault(a, {"av": 0, "ts": 0, "dx": {}, "fd": 0, "p": {}, "pts": {}, "fs": {}})
 
 # ---------------- 1. markets ----------------
 dex_list = [d["name"] for d in (post({"type": "perpDexs"}, 20) or []) if d and d.get("name")]
 new_dexes = [d for d in dex_list if d not in state["known_dexes"]] if state["known_dexes"] else []
 markets = []   # (coin, dex, dayNtlVlm)
+PX = {}        # coin -> mark price (values closed positions in the changes list)
 for dex in [""] + dex_list:
     r = post({"type": "metaAndAssetCtxs", **({"dex": dex} if dex else {})}, 20)
     if not r: continue
     for u, c in zip(r[0]["universe"], r[1]):
         if u.get("isDelisted"): continue
         markets.append((u["name"], dex, float(c.get("dayNtlVlm") or 0)))
+        try: PX[u["name"]] = float(c.get("markPx") or 0)
+        except Exception: pass
 log(f"markets: {len(markets)} on {1+len(dex_list)} dexes; new dexes since last run: {new_dexes or '-'}")
 
 # ---------------- 2. addresses ----------------
 lb = get_json(LB_URL)["leaderboardRows"]
 lb_av = {r["ethAddress"].lower(): float(r["accountValue"] or 0) for r in lb}
+def _alltime(r):
+    for w in r.get("windowPerformances") or []:
+        if w and w[0] == "allTime":
+            try: return float(w[1].get("pnl"))
+            except Exception: return None
+    return None
+lb_pnl = {r["ethAddress"].lower(): _alltime(r) for r in lb}
 lb_rank = {a: i + 1 for i, a in enumerate(sorted(lb_av, key=lambda a: -lb_av[a]))}
 for a, v in lb_av.items():
-    if v >= MIN_AV or a in A: rec(a)["av"] = v
+    if v >= MIN_AV or a in A:
+        r_ = rec(a); r_["av"] = v
+        if lb_pnl.get(a) is not None: r_["pl"] = round(lb_pnl[a])
 log(f"leaderboard: {len(lb_av)} addresses, {sum(1 for v in lb_av.values() if v >= MIN_AV)} with >= ${MIN_AV}")
 
 active = {}    # addr -> set(dex) seen trading big this run (dex '' = main)
@@ -159,7 +189,8 @@ def interval_ms(a, r):
 tasks = []   # (score, addr, dex)
 for a, r in A.items():
     if r["av"] < MIN_AV and a not in active and not r["p"]: continue                      # dust, never active, holds nothing
-    due = (NOW - r["ts"]) / interval_ms(a, r)
+    # never scanned: just above "due now", so it cannot starve the hourly re-scans of big holders (which feed the changes list)
+    due = (NOW - r["ts"]) / interval_ms(a, r) if r["ts"] else 1.5
     if a in active: due += 10
     tasks.append((due, a, ""))
     dexes = set(d for d, t in r["dx"].items() if NOW - t < DEX_KEEP_MS) | (active.get(a, set()) - {""})
@@ -206,6 +237,16 @@ def scan(t):
                           lev.get("value"), float(p["liquidationPx"]) if p.get("liquidationPx") else None, "i" if lev.get("type") == "isolated" else "c"]
     with lock:
         global done_dex, found_new_dex
+        # position changes since the previous scan of this (address, dex)
+        prev = r["pts"].get(d)
+        if prev and ts - prev <= CH_SPAN_MAX:
+            old = {c: v for c, v in r["p"].items() if (c.split(":")[0] if ":" in c else "") == d}
+            for c in set(old) | set(pos):
+                b = old[c][1] if c in old else 0.0; a_ = pos[c][1] if c in pos else 0.0
+                if b == a_: continue
+                px = pos[c][2] / abs(a_) if c in pos and a_ else (PX.get(c) or (old[c][3] if c in old else 0))
+                if abs(a_ - b) * px < CH_MIN: continue
+                EV.append([a, c, ts // 1000, prev // 1000, float(f"{b:.6g}"), float(f"{a_:.6g}"), float(f"{px:.6g}")])
         # replace this dex's positions
         for c in [c for c in r["p"] if (c.split(":")[0] if ":" in c else "") == d]: del r["p"][c]
         for c, v in pos.items():
@@ -245,8 +286,10 @@ for a, r in A.items():
         pts = r["pts"].get(d, 0)
         if NOW - pts > STALE_MS: continue
         coins.setdefault(c, []).append((a, v, r, pts))
-os.makedirs(os.path.join(args.out, "coins"), exist_ok=True)
-for f in os.listdir(os.path.join(args.out, "coins")): os.remove(os.path.join(args.out, "coins", f))
+for sub in ("coins", "changes"):
+    os.makedirs(os.path.join(args.out, sub), exist_ok=True)
+    for f in os.listdir(os.path.join(args.out, sub)): os.remove(os.path.join(args.out, sub, f))
+coh = lambda a, r: (pnl_coh(r.get("pl")), size_coh(r["av"]))
 index = {}
 r6 = lambda x: float(f"{x:.6g}") if isinstance(x, float) else x
 for c, hs in coins.items():
@@ -257,13 +300,85 @@ for c, hs in coins.items():
     rows = []
     for a, v, r, pts in keep:
         fs = r["fs"].get(c + "|" + str(v[0]), 0)
-        rows.append([a, v[0], r6(v[1]), round(v[2]), r6(v[3]), round(v[4]), v[5], r6(v[6]) if v[6] else None, v[7], round(r["av"]), fs // 1000 if fs else 0, pts // 1000, lb_rank.get(a, 0)])
+        rows.append([a, v[0], r6(v[1]), round(v[2]), r6(v[3]), round(v[4]), v[5], r6(v[6]) if v[6] else None, v[7], round(r["av"]), fs // 1000 if fs else 0, pts // 1000, lb_rank.get(a, 0), *coh(a, r)])
     fn = c.replace(":", "_").replace("/", "-") + ".json"
     body = {"coin": c, "generatedAt": NOW // 1000,
-            "cols": ["addr", "side", "szi", "ntl", "entry", "upnl", "lev", "liq", "mode", "av", "firstSeen", "scannedAt", "lbRank"],
-            "rows": rows, "omitted": {"n": len(om), "ntl": round(sum(abs(h[1][2]) for h in om))}}
+            "cols": ["addr", "side", "szi", "ntl", "entry", "upnl", "lev", "liq", "mode", "av", "firstSeen", "scannedAt", "lbRank", "pnlCohort", "sizeCohort"],
+            "rows": rows, "omitted": {"n": len(om), "ntl": round(sum(abs(h[1][2]) for h in om)), "max": round(abs(om[0][1][2])) if om else 0}}
     with open(os.path.join(args.out, "coins", fn), "w") as f: json.dump(body, f, separators=(",", ":"))
     index[c] = {"f": fn, "n": len(hs), "nL": len(L), "nS": len(S), "vL": round(sum(h[1][2] for h in L)), "vS": round(sum(h[1][2] for h in S))}
+# ---- cohorts: long/short by all-time-PnL group and by account-size group, per asset + all assets ----
+def cells(hs, k):
+    out = [[0, 0, 0] for _ in range(6 if k == 0 else 5)]
+    for a, v, r, pts in hs:
+        i = coh(a, r)[k]
+        if i < 0: continue
+        o = out[i]; o[0] += 1; o[1 if v[0] > 0 else 2] += abs(v[2])
+    return [[n, round(l), round(s_)] for n, l, s_ in out]
+coh_coins = {}
+for c, hs in coins.items():
+    if len(hs) < 10: continue
+    coh_coins[c] = {"n": len(hs), "p": cells(hs, 0), "s": cells(hs, 1), "u": sum(1 for a, v, r, pts in hs if r.get("pl") is None)}
+tot = lambda c: index[c]["vL"] + index[c]["vS"]
+main = [c for c in ("BTC", "ETH", "HYPE", "SOL") if c in coh_coins]
+xyz = sorted((c for c in coh_coins if c.startswith("xyz:")), key=lambda c: -tot(c))[:4]
+other = sorted((c for c in coh_coins if ":" not in c and c not in main), key=lambda c: -tot(c))[:4]
+allw = {}   # all assets: unique wallets per cohort, summed long/short value
+def all_cells(k):
+    out = [[set(), 0, 0] for _ in range(6 if k == 0 else 5)]
+    for c, hs in coins.items():
+        for a, v, r, pts in hs:
+            i = coh(a, r)[k]
+            if i < 0: continue
+            o = out[i]; o[0].add(a); o[1 if v[0] > 0 else 2] += abs(v[2])
+    return [[len(w), round(l), round(s_)] for w, l, s_ in out]
+cohorts = {"v": 1, "generatedAt": NOW // 1000, "edges": {"p": PNL_EDGES, "s": SIZE_EDGES}, "rows": main + xyz + other,
+           "all": {"p": all_cells(0), "s": all_cells(1), "n": len({a for hs in coins.values() for a, *_ in hs})}, "coins": coh_coins}
+with open(os.path.join(args.out, "cohorts.json"), "w") as f: json.dump(cohorts, f, separators=(",", ":"))
+
+# ---- position changes (last 24 h), per asset; a wallet's events are kept or dropped together ----
+by_coin = {}
+for e in EV: by_coin.setdefault(e[1], {}).setdefault(e[0], []).append(e)
+n_ch = 0
+for c, per in by_coin.items():
+    ws_ = sorted(per.items(), key=lambda kv: -max(abs(e[5] - e[4]) * e[6] for e in kv[1]))
+    keep = [kv for i, kv in enumerate(ws_) if max(abs(e[5] - e[4]) * e[6] for e in kv[1]) >= KEEP_MIN or i < KEEP_TOP][:KEEP_MAX]
+    om = ws_[len(keep):]
+    rows = []
+    for a, evs in keep:
+        r = A.get(a) or {"av": 0}; pc, zc = coh(a, r)
+        for e in sorted(evs, key=lambda e: e[2]): rows.append([a, e[4], e[5], e[6], e[2], e[3], round(r["av"]), lb_rank.get(a, 0), pc, zc])
+    fn = c.replace(":", "_").replace("/", "-") + ".json"
+    omv = [max(abs(e[5] - e[4]) * e[6] for e in evs) for a, evs in om]
+    with open(os.path.join(args.out, "changes", fn), "w") as f:
+        json.dump({"coin": c, "generatedAt": NOW // 1000, "cols": ["addr", "sziBefore", "sziAfter", "px", "t", "tPrev", "av", "lbRank", "pnlCohort", "sizeCohort"],
+                   "rows": rows, "omitted": {"n": len(om), "ntl": round(sum(omv)), "max": round(max(omv)) if omv else 0}}, f, separators=(",", ":"))
+    ix_ = index.setdefault(c, {"f": "", "n": 0, "nL": 0, "nS": 0, "vL": 0, "vS": 0}); ix_["cf"] = fn; ix_["ch"] = len(per)
+    n_ch += len(per)
+# ---- big position changes across ALL assets: since the previous scan (= found in this run), 6 h, 24 h; merged per wallet+asset ----
+TOP_N = 300
+def merged(since_ms):
+    g = {}
+    for e in sorted(EV, key=lambda e: e[2]):
+        if e[2] * 1000 < since_ms: continue
+        k = (e[0], e[1]); m = g.get(k)
+        if m is None: g[k] = [e[1], e[0], e[4], e[5], e[6], e[2], e[3]]
+        else: m[3] = e[5]; m[4] = e[6]; m[5] = e[2]
+    out = []
+    for m in g.values():
+        b_, a_, px = m[2], m[3], m[4]
+        if b_ == a_: continue
+        flip = b_ and a_ and (b_ > 0) != (a_ > 0)
+        d = (abs(a_) + abs(b_)) * px if flip else abs(abs(a_) - abs(b_)) * px
+        r = A.get(m[1]) or {"av": 0}; pc, zc = coh(m[1], r)
+        out.append((d, m + [round(r["av"]), lb_rank.get(m[1], 0), pc, zc]))
+    out.sort(key=lambda x: -x[0])
+    return {"rows": [x[1] for x in out[:TOP_N]], "omitted": {"n": max(0, len(out) - TOP_N), "max": round(out[TOP_N][0]) if len(out) > TOP_N else 0}, "total": len(out)}
+top = {"v": 1, "generatedAt": NOW // 1000, "runStart": NOW // 1000, "prevRun": RUNS[-2] if len(RUNS) > 1 else 0,
+       "cols": ["coin", "addr", "sziBefore", "sziAfter", "px", "t", "tPrev", "av", "lbRank", "pnlCohort", "sizeCohort"],
+       "windows": {"last": merged(NOW), "6": merged(NOW - 6 * 3600e3), "24": merged(NOW - 24 * 3600e3)}}
+with open(os.path.join(args.out, "changes", "top.json"), "w") as f: json.dump(top, f, separators=(",", ":"))
+log(f"changes: {len(EV)} events in 24 h, {n_ch} wallet/asset pairs on {len(by_coin)} assets; cohorts on {len(coh_coins)} assets")
 # every listed market gets an index entry (n=0, no file when nobody tracked holds it), so the site can offer ALL coins
 for c, d, vol in markets:
     if c not in index: index[c] = {"f": "", "n": 0, "nL": 0, "nS": 0, "vL": 0, "vS": 0}
@@ -276,7 +391,8 @@ cov = {"lbAddresses": len(lb_av), "lbAtLeastMinAv": sum(1 for v in lb_av.values(
        "calls": stats["calls"], "weight": stats["weight"], "r429": stats["r429"], "errors": stats["errors"],
        "durationSec": round(time.time() - T0), "ratePerMin": args.rate, "dexes": [""] + dex_list}
 with open(os.path.join(args.out, "index.json"), "w") as f:
-    json.dump({"v": 1, "generatedAt": NOW // 1000, "coverage": cov, "coins": index}, f, separators=(",", ":"))
+    json.dump({"v": 1, "generatedAt": NOW // 1000, "coverage": cov, "coins": index, "edges": {"p": PNL_EDGES, "s": SIZE_EDGES},
+               "changes": {"runs": len(RUNS), "firstRun": RUNS[0], "events": len(EV)}}, f, separators=(",", ":"))
 # state: drop addresses that are dust, inactive and empty for a long time
 for a in [a for a, r in A.items() if r["av"] < MIN_AV and not r["p"] and not r["dx"] and NOW - r["ts"] > 7 * 864e5]: del A[a]
 open(SP, "wb").write(gzip.compress(json.dumps(state, separators=(",", ":")).encode(), 6))
