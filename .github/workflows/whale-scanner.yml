@@ -1,0 +1,39 @@
+name: whale-scanner
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: whale-scanner
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install "websockets>=12,<16"
+      - name: Restore memory from the data branch
+        run: |
+          mkdir -p state out
+          if git fetch --depth=1 origin data 2>/dev/null; then
+            git show origin/data:state/state.json.gz > state/state.json.gz 2>/dev/null || rm -f state/state.json.gz
+          fi
+          ls -la state
+      - name: Scan
+        run: python whale-scanner/scan.py --minutes 45 --rate 1000 --ws-seconds 180 --out out --state state
+      - name: Publish to the data branch
+        run: |
+          mkdir -p out/state && cp state/state.json.gz out/state/
+          cd out
+          git init -q -b data
+          git config user.name "whale-scanner"; git config user.email "whale-scanner@users.noreply.github.com"
+          git add -A
+          git commit -qm "scan $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -fq "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
